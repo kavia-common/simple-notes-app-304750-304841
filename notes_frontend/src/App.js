@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
+import { createNote, deleteNote, isBackendEnabled, listNotes, updateNote } from "./api/client";
 
 /**
  * Notes app data model:
@@ -30,6 +31,7 @@ function App() {
     };
   }, []);
 
+  // Local-first initial state (fast paint), then hydrate via API client (backend or local fallback).
   const [notes, setNotes] = useState(() => loadNotesWithSeed());
   const [selectedId, setSelectedId] = useState(() => {
     const initial = loadNotesWithSeed();
@@ -37,6 +39,17 @@ function App() {
   });
   const [query, setQuery] = useState("");
   const [isConfirmOpen, setIsConfirmOpen] = useState(false);
+
+  // Minimal status: keep UI undisturbed while surfacing connectivity/loading issues.
+  const [isLoading, setIsLoading] = useState(true);
+  const [banner, setBanner] = useState({ tone: "muted", message: "" });
+
+  // Track current async ops for optimistic reconciliation.
+  const pendingOpsRef = useRef(
+    /** @type {Map<string, { type: "create" | "update" | "delete", id: string, snapshot?: any, serverId?: string }>} */ (
+      new Map()
+    )
+  );
 
   /** Editor local state so we can debounce writes to notes[] */
   const selectedNote = useMemo(
@@ -57,7 +70,68 @@ function App() {
     setIsDirty(false);
   }, [selectedNote?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /** Persist to localStorage anytime notes change */
+  /**
+   * Load notes using the API client:
+   * - When backend env vars are set, client will attempt network.
+   * - If unreachable/not set, client falls back to localStorage automatically.
+   */
+  useEffect(() => {
+    let cancelled = false;
+
+    const run = async () => {
+      setIsLoading(true);
+
+      const backendConfigured = isBackendEnabled();
+      if (backendConfigured) {
+        setBanner({ tone: "muted", message: "Syncing with backend…" });
+      } else {
+        setBanner({ tone: "muted", message: "Local mode (offline-ready)" });
+      }
+
+      try {
+        const loaded = await listNotes();
+        if (cancelled) return;
+
+        // If backend returned empty and local has no notes, seed for a friendly first-run.
+        const next = loaded.length ? loaded : loadNotesWithSeed();
+
+        setNotes(next);
+        setSelectedId((prev) => {
+          if (prev && next.some((n) => n.id === prev)) return prev;
+          return next.length ? next[0].id : null;
+        });
+
+        // If we expected backend but got here, we may still have fallen back silently;
+        // keep banner minimal and non-blocking.
+        setBanner((b) => {
+          if (!backendConfigured) return b;
+          return { tone: "muted", message: "Ready" };
+        });
+      } catch (err) {
+        if (cancelled) return;
+        setBanner({
+          tone: "danger",
+          message: `Could not load notes from backend. Using local storage.`,
+        });
+        // Keep already-painted local notes.
+      } finally {
+        if (!cancelled) setIsLoading(false);
+        // Auto-clear non-danger banners after a moment to reduce visual noise.
+        window.setTimeout(() => {
+          if (cancelled) return;
+          setBanner((b) => (b.tone === "danger" ? b : { tone: "muted", message: "" }));
+        }, 2200);
+      }
+    };
+
+    run();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** Persist to localStorage anytime notes change (legacy key for backwards-compat). */
   useEffect(() => {
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(notes));
@@ -93,24 +167,61 @@ function App() {
     }
   }, [notes, selectedId]);
 
+  const withTransientBanner = (tone, message) => {
+    setBanner({ tone, message });
+    if (tone !== "danger") {
+      window.setTimeout(() => setBanner({ tone: "muted", message: "" }), 2200);
+    }
+  };
+
   // PUBLIC_INTERFACE
-  const createNewNote = () => {
+  const createNewNote = async () => {
     const now = Date.now();
-    const newNote = {
-      id: makeId(),
+    const tempId = makeId();
+    const optimistic = {
+      id: tempId,
       title: "Untitled note",
       content: "",
       createdAt: now,
       updatedAt: now,
     };
-    setNotes((prev) => [newNote, ...prev]);
-    setSelectedId(newNote.id);
+
+    // Optimistic UI update.
+    setNotes((prev) => [optimistic, ...prev]);
+    setSelectedId(tempId);
 
     // Focus title after render
     requestAnimationFrame(() => {
       const el = document.getElementById("note-title-input");
       if (el) el.focus();
     });
+
+    // Reconcile with API client. It will fallback to localStorage if offline/unconfigured.
+    const opId = `op_create_${tempId}_${now}`;
+    pendingOpsRef.current.set(opId, { type: "create", id: tempId });
+
+    try {
+      const created = await createNote(optimistic);
+
+      // If backend assigned a different id, reconcile state.
+      if (created && created.id && created.id !== tempId) {
+        setNotes((prev) =>
+          prev.map((n) => (n.id === tempId ? { ...created } : n))
+        );
+        setSelectedId((prev) => (prev === tempId ? created.id : prev));
+      } else if (created) {
+        setNotes((prev) => prev.map((n) => (n.id === tempId ? { ...created } : n)));
+      }
+
+      withTransientBanner("muted", "Note created");
+    } catch (err) {
+      // Most failures will have already fallen back to local create; this is a last resort.
+      setNotes((prev) => prev.filter((n) => n.id !== tempId));
+      setSelectedId((prev) => (prev === tempId ? null : prev));
+      setBanner({ tone: "danger", message: "Could not create note." });
+    } finally {
+      pendingOpsRef.current.delete(opId);
+    }
   };
 
   // PUBLIC_INTERFACE
@@ -119,14 +230,39 @@ function App() {
     setIsConfirmOpen(true);
   };
 
-  const confirmDeleteSelected = () => {
+  const confirmDeleteSelected = async () => {
     if (!selectedNote) {
       setIsConfirmOpen(false);
       return;
     }
+
     const idToDelete = selectedNote.id;
+
+    // Optimistic delete with rollback.
+    const snapshot = selectedNote;
+    const opId = `op_delete_${idToDelete}_${Date.now()}`;
+    pendingOpsRef.current.set(opId, { type: "delete", id: idToDelete, snapshot });
+
     setNotes((prev) => prev.filter((n) => n.id !== idToDelete));
     setIsConfirmOpen(false);
+
+    try {
+      const ok = await deleteNote(idToDelete);
+      if (!ok) {
+        // If API says not deleted, restore.
+        setNotes((prev) => [snapshot, ...prev]);
+        setBanner({ tone: "danger", message: "Could not delete note." });
+        return;
+      }
+
+      withTransientBanner("muted", "Note deleted");
+    } catch (err) {
+      // Rollback on unexpected error.
+      setNotes((prev) => [snapshot, ...prev]);
+      setBanner({ tone: "danger", message: "Could not delete note." });
+    } finally {
+      pendingOpsRef.current.delete(opId);
+    }
   };
 
   const cancelDelete = () => setIsConfirmOpen(false);
@@ -150,25 +286,25 @@ function App() {
       window.clearTimeout(autosaveTimerRef.current);
     }
 
-    autosaveTimerRef.current = window.setTimeout(() => {
+    autosaveTimerRef.current = window.setTimeout(async () => {
+      const normalizedTitle = normalizeTitle(title);
+      const now = Date.now();
+
+      // Optimistically update local state immediately.
       setNotes((prev) => {
         const idx = prev.findIndex((n) => n.id === selectedId);
         if (idx === -1) return prev;
 
         const current = prev[idx];
-        const normalizedTitle = normalizeTitle(title);
         const updated = {
           ...current,
           title: normalizedTitle,
           content: content ?? "",
-          updatedAt: Date.now(),
+          updatedAt: now,
         };
 
         // If nothing actually changed, avoid resort churn.
-        if (
-          updated.title === current.title &&
-          updated.content === current.content
-        ) {
+        if (updated.title === current.title && updated.content === current.content) {
           return prev;
         }
 
@@ -177,8 +313,34 @@ function App() {
         return next;
       });
 
-      lastSavedAtRef.current = Date.now();
-      setIsDirty(false);
+      // Persist via client (backend if possible, local fallback if offline).
+      const opId = `op_update_${selectedId}_${now}`;
+      const snapshot = selectedNote;
+      pendingOpsRef.current.set(opId, { type: "update", id: selectedId, snapshot });
+
+      try {
+        const updatedFromApi = await updateNote(selectedId, {
+          title: normalizedTitle,
+          content: content ?? "",
+          updatedAt: now,
+        });
+
+        // If API returns canonical note, reconcile (e.g., server timestamps).
+        if (updatedFromApi) {
+          setNotes((prev) => prev.map((n) => (n.id === selectedId ? updatedFromApi : n)));
+        }
+
+        lastSavedAtRef.current = Date.now();
+        setIsDirty(false);
+      } catch (err) {
+        // Revert on hard failure (client usually falls back, so this is uncommon).
+        if (snapshot) {
+          setNotes((prev) => prev.map((n) => (n.id === selectedId ? snapshot : n)));
+        }
+        setBanner({ tone: "danger", message: "Autosave failed. Changes were reverted." });
+      } finally {
+        pendingOpsRef.current.delete(opId);
+      }
     }, AUTOSAVE_DEBOUNCE_MS);
   };
 
@@ -189,30 +351,55 @@ function App() {
     };
   }, []);
 
-  const onSelectNote = (id) => {
+  const flushPendingAutosave = async () => {
+    if (!selectedId) return;
+
+    const normalizedTitle = normalizeTitle(draftTitle);
+    const now = Date.now();
+
+    // Update local state immediately.
+    setNotes((prev) => {
+      const idx = prev.findIndex((n) => n.id === selectedId);
+      if (idx === -1) return prev;
+      const current = prev[idx];
+
+      const updated = {
+        ...current,
+        title: normalizedTitle,
+        content: draftContent,
+        updatedAt: now,
+      };
+
+      // Avoid unnecessary state change.
+      if (updated.title === current.title && updated.content === current.content) {
+        return prev;
+      }
+
+      const next = [...prev];
+      next[idx] = updated;
+      return next;
+    });
+
+    try {
+      await updateNote(selectedId, {
+        title: normalizedTitle,
+        content: draftContent,
+        updatedAt: now,
+      });
+      lastSavedAtRef.current = Date.now();
+      setIsDirty(false);
+    } catch {
+      // Keep silent to avoid disrupting navigation. Autosave debounce will retry later.
+      setBanner({ tone: "danger", message: "Could not save changes (offline?)" });
+    }
+  };
+
+  const onSelectNote = async (id) => {
     // If user switches quickly, flush pending autosave to reduce data loss.
     if (autosaveTimerRef.current) {
       window.clearTimeout(autosaveTimerRef.current);
       autosaveTimerRef.current = null;
-      // best-effort immediate save
-      if (selectedId) {
-        setNotes((prev) => {
-          const idx = prev.findIndex((n) => n.id === selectedId);
-          if (idx === -1) return prev;
-          const current = prev[idx];
-          const normalizedTitle = normalizeTitle(draftTitle);
-          const updated = {
-            ...current,
-            title: normalizedTitle,
-            content: draftContent,
-            updatedAt: Date.now(),
-          };
-          const next = [...prev];
-          next[idx] = updated;
-          return next;
-        });
-        setIsDirty(false);
-      }
+      await flushPendingAutosave();
     }
 
     setSelectedId(id);
@@ -252,6 +439,8 @@ function App() {
         onDelete={requestDeleteSelected}
         canDelete={Boolean(selectedNote)}
         env={env}
+        banner={banner}
+        isLoading={isLoading}
       />
 
       <div className="Layout">
@@ -359,20 +548,37 @@ function App() {
 
 /* ----------------------------- Components ----------------------------- */
 
-function Header({ onNew, onDelete, canDelete, env }) {
+function Header({ onNew, onDelete, canDelete, env, banner, isLoading }) {
+  const bannerToneClass =
+    banner?.tone === "danger"
+      ? "Pill"
+      : banner?.tone === "primary"
+        ? "Pill PillPrimary"
+        : "Pill PillMuted";
+
   return (
     <header className="Header">
       <div className="HeaderLeft">
         <div className="BrandMark" aria-hidden="true" />
         <div>
           <div className="HeaderTitle">Ocean Notes</div>
-          <div className="HeaderSubtitle">
-            Local-only notes • Autosave • Search
-          </div>
+          <div className="HeaderSubtitle">Local-first notes • Autosave • Search</div>
         </div>
       </div>
 
       <div className="HeaderRight" role="toolbar" aria-label="App actions">
+        {/* Minimal, non-disruptive status */}
+        {isLoading ? (
+          <span className="Pill PillMuted" aria-live="polite">
+            Loading…
+          </span>
+        ) : null}
+        {banner?.message ? (
+          <span className={bannerToneClass} aria-live="polite" title={banner.message}>
+            {banner.message}
+          </span>
+        ) : null}
+
         <Button variant="ghost" onClick={onNew} ariaLabel="Create new note">
           New
         </Button>
