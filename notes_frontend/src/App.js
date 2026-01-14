@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { createNote, deleteNote, isBackendEnabled, listNotes, updateNote } from "./api/client";
+import { readUiPrefs, writeUiPrefs } from "./api/storage";
 
 /**
  * Notes app data model:
@@ -17,6 +18,10 @@ const STORAGE_KEY = "ocean_notes_v1";
 
 /** Milliseconds to debounce autosave while typing */
 const AUTOSAVE_DEBOUNCE_MS = 450;
+
+const UI_PREFS_KEY = "ocean_notes_ui_v1";
+
+/** @typedef {"updated_desc" | "created_desc" | "title_asc"} SortOrder */
 
 // PUBLIC_INTERFACE
 function App() {
@@ -40,9 +45,23 @@ function App() {
   const [query, setQuery] = useState("");
   const [isConfirmOpen, setIsConfirmOpen] = useState(false);
 
+  // UI preferences (persisted)
+  const [sortOrder, setSortOrder] = useState(
+    /** @type {SortOrder} */ (
+      readUiPrefs(UI_PREFS_KEY)?.sortOrder || /** @type {SortOrder} */ ("updated_desc")
+    )
+  );
+  const [onlyWithContent, setOnlyWithContent] = useState(
+    Boolean(readUiPrefs(UI_PREFS_KEY)?.onlyWithContent)
+  );
+
   // Minimal status: keep UI undisturbed while surfacing connectivity/loading issues.
   const [isLoading, setIsLoading] = useState(true);
   const [banner, setBanner] = useState({ tone: "muted", message: "" });
+
+  // Save status pill + online/offline detection
+  const [isOnline, setIsOnline] = useState(() => (typeof navigator !== "undefined" ? navigator.onLine : true));
+  const [savePhase, setSavePhase] = useState(/** @type {"saved" | "saving"} */ ("saved"));
 
   // Track current async ops for optimistic reconciliation.
   const pendingOpsRef = useRef(
@@ -63,12 +82,33 @@ function App() {
   const autosaveTimerRef = useRef(null);
   const lastSavedAtRef = useRef(0);
 
+  const searchInputRef = useRef(null);
+  const editorTextAreaRef = useRef(null);
+
   /** Keep draft in sync when switching notes */
   useEffect(() => {
     setDraftTitle(selectedNote?.title || "");
     setDraftContent(selectedNote?.content || "");
     setIsDirty(false);
+    setSavePhase("saved");
   }, [selectedNote?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Online/offline events for status pill. */
+  useEffect(() => {
+    const on = () => setIsOnline(true);
+    const off = () => setIsOnline(false);
+    window.addEventListener("online", on);
+    window.addEventListener("offline", off);
+    return () => {
+      window.removeEventListener("online", on);
+      window.removeEventListener("offline", off);
+    };
+  }, []);
+
+  /** Persist UI preferences */
+  useEffect(() => {
+    writeUiPrefs(UI_PREFS_KEY, { sortOrder, onlyWithContent });
+  }, [sortOrder, onlyWithContent]);
 
   /**
    * Load notes using the API client:
@@ -143,18 +183,25 @@ function App() {
     }
   }, [notes]);
 
-  /** Derived list: search + sorting */
+  /** Derived list: search + sorting + quick filter */
   const filteredNotes = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const base = [...notes].sort((a, b) => b.updatedAt - a.updatedAt);
 
-    if (!q) return base;
+    // Optional quick filter: hide completely empty notes (no title and no content)
+    // NOTE: we treat "Untitled note" (seed/default) as empty title for filter purposes.
+    const baseFiltered = onlyWithContent
+      ? notes.filter((n) => !isNoteFullyEmpty(n))
+      : notes;
 
-    return base.filter((n) => {
+    const sorted = [...baseFiltered].sort((a, b) => sortNotes(a, b, sortOrder));
+
+    if (!q) return sorted;
+
+    return sorted.filter((n) => {
       const hay = `${n.title}\n${n.content}`.toLowerCase();
       return hay.includes(q);
     });
-  }, [notes, query]);
+  }, [notes, query, sortOrder, onlyWithContent]);
 
   /** Ensure selectedId always points to an existing note if any exist */
   useEffect(() => {
@@ -180,7 +227,7 @@ function App() {
     const tempId = makeId();
     const optimistic = {
       id: tempId,
-      title: "Untitled note",
+      title: "",
       content: "",
       createdAt: now,
       updatedAt: now,
@@ -190,9 +237,9 @@ function App() {
     setNotes((prev) => [optimistic, ...prev]);
     setSelectedId(tempId);
 
-    // Focus title after render
+    // Focus editor (content area) after render
     requestAnimationFrame(() => {
-      const el = document.getElementById("note-title-input");
+      const el = editorTextAreaRef.current || document.getElementById(`note-content-${tempId}`);
       if (el) el.focus();
     });
 
@@ -205,9 +252,7 @@ function App() {
 
       // If backend assigned a different id, reconcile state.
       if (created && created.id && created.id !== tempId) {
-        setNotes((prev) =>
-          prev.map((n) => (n.id === tempId ? { ...created } : n))
-        );
+        setNotes((prev) => prev.map((n) => (n.id === tempId ? { ...created } : n)));
         setSelectedId((prev) => (prev === tempId ? created.id : prev));
       } else if (created) {
         setNotes((prev) => prev.map((n) => (n.id === tempId ? { ...created } : n)));
@@ -270,13 +315,33 @@ function App() {
   const updateDraftTitle = (value) => {
     setDraftTitle(value);
     setIsDirty(true);
+    setSavePhase("saving");
     scheduleAutosave({ title: value, content: draftContent });
   };
 
   const updateDraftContent = (value) => {
     setDraftContent(value);
     setIsDirty(true);
+    setSavePhase("saving");
     scheduleAutosave({ title: draftTitle, content: value });
+  };
+
+  const onTitleBlur = () => {
+    // If title is empty, generate from first non-empty line of content.
+    const t = (draftTitle ?? "").trim();
+    if (t.length > 0) {
+      // Ensure any trailing spaces etc. are normalized.
+      if (t !== draftTitle) updateDraftTitle(t);
+      return;
+    }
+
+    const generated = generateTitleFromContent(draftContent);
+    if (generated) {
+      setDraftTitle(generated);
+      setIsDirty(true);
+      setSavePhase("saving");
+      scheduleAutosave({ title: generated, content: draftContent });
+    }
   };
 
   const scheduleAutosave = ({ title, content }) => {
@@ -332,12 +397,14 @@ function App() {
 
         lastSavedAtRef.current = Date.now();
         setIsDirty(false);
+        setSavePhase("saved");
       } catch (err) {
         // Revert on hard failure (client usually falls back, so this is uncommon).
         if (snapshot) {
           setNotes((prev) => prev.map((n) => (n.id === selectedId ? snapshot : n)));
         }
         setBanner({ tone: "danger", message: "Autosave failed. Changes were reverted." });
+        setSavePhase("saved");
       } finally {
         pendingOpsRef.current.delete(opId);
       }
@@ -381,6 +448,7 @@ function App() {
     });
 
     try {
+      setSavePhase("saving");
       await updateNote(selectedId, {
         title: normalizedTitle,
         content: draftContent,
@@ -388,9 +456,11 @@ function App() {
       });
       lastSavedAtRef.current = Date.now();
       setIsDirty(false);
+      setSavePhase("saved");
     } catch {
       // Keep silent to avoid disrupting navigation. Autosave debounce will retry later.
       setBanner({ tone: "danger", message: "Could not save changes (offline?)" });
+      setSavePhase("saved");
     }
   };
 
@@ -432,6 +502,49 @@ function App() {
     }
   };
 
+  /** Global keyboard shortcuts (no backend required) */
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const isMod = e.metaKey || e.ctrlKey;
+      if (!isMod) return;
+
+      const key = e.key.toLowerCase();
+
+      // Avoid capturing inside modal dialogs (but allow Esc handled in modal).
+      if (isConfirmOpen) return;
+
+      if (key === "n") {
+        e.preventDefault();
+        createNewNote();
+        return;
+      }
+
+      if (key === "f") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        return;
+      }
+
+      // Cmd/Ctrl + Backspace: delete current note (keeps confirmation modal)
+      if (e.key === "Backspace") {
+        e.preventDefault();
+        requestDeleteSelected();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isConfirmOpen, selectedNote?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const saveStatusLabel = useMemo(() => {
+    // Requirements: “Saved”, “Saving…”, or “Offline (local only)”.
+    // Use online/offline detection plus local-first assumption.
+    if (!isOnline) return "Offline (local only)";
+    return savePhase === "saving" ? "Saving…" : "Saved";
+  }, [isOnline, savePhase]);
+
+  const showMainEmpty = notes.length === 0;
+
   return (
     <div className="AppShell">
       <Header
@@ -441,6 +554,7 @@ function App() {
         env={env}
         banner={banner}
         isLoading={isLoading}
+        saveStatusLabel={saveStatusLabel}
       />
 
       <div className="Layout">
@@ -466,10 +580,42 @@ function App() {
                 placeholder="Search by title or content…"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
+                inputRef={searchInputRef}
+                showShortcutHint
               />
               <div className="SidebarMeta" aria-live="polite">
                 {filteredNotes.length} {filteredNotes.length === 1 ? "note" : "notes"}
                 {query.trim() ? " (filtered)" : ""}
+              </div>
+            </div>
+
+            <div className="SidebarControls" aria-label="Sorting and filters">
+              <div className="SidebarControlsRow">
+                <div className="Field">
+                  <label className="FieldLabel" htmlFor="sort-order">
+                    Sort
+                  </label>
+                  <select
+                    id="sort-order"
+                    className="FieldSelect"
+                    value={sortOrder}
+                    onChange={(e) => setSortOrder(/** @type {SortOrder} */ (e.target.value))}
+                  >
+                    <option value="updated_desc">Updated (newest)</option>
+                    <option value="created_desc">Created (newest)</option>
+                    <option value="title_asc">Title (A→Z)</option>
+                  </select>
+                </div>
+
+                <label className="Check" htmlFor="filter-content">
+                  <input
+                    id="filter-content"
+                    type="checkbox"
+                    checked={onlyWithContent}
+                    onChange={(e) => setOnlyWithContent(e.target.checked)}
+                  />
+                  <span>Only with content</span>
+                </label>
               </div>
             </div>
           </div>
@@ -482,16 +628,26 @@ function App() {
             onKeyDown={onNoteListKeyDown}
           >
             {filteredNotes.length === 0 ? (
-              <EmptyState
-                title={notes.length === 0 ? "No notes yet" : "No matching notes"}
-                description={
-                  notes.length === 0
-                    ? "Create your first note to get started."
-                    : "Try a different search term."
-                }
-                actionLabel={notes.length === 0 ? "Create a note" : "Clear search"}
-                onAction={() => (notes.length === 0 ? createNewNote() : setQuery(""))}
-              />
+              notes.length === 0 ? (
+                <div className="SidebarEmptyHint" aria-live="polite">
+                  <span className="SidebarEmptyHintText">Create your first note to get started.</span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={createNewNote}
+                    ariaLabel="Create your first note"
+                  >
+                    New note
+                  </Button>
+                </div>
+              ) : (
+                <EmptyState
+                  title="No matching notes"
+                  description="Try a different search term, or turn off filters."
+                  actionLabel="Clear search"
+                  onAction={() => setQuery("")}
+                />
+              )
             ) : (
               filteredNotes.map((note) => (
                 <NoteListItem
@@ -516,17 +672,28 @@ function App() {
               isDirty={isDirty}
               lastSavedAt={lastSavedAtRef.current}
               onTitleChange={updateDraftTitle}
+              onTitleBlur={onTitleBlur}
               onContentChange={updateDraftContent}
               onDelete={requestDeleteSelected}
+              contentRef={editorTextAreaRef}
             />
           ) : (
             <div className="MainSurface">
-              <EmptyState
-                title="Select a note"
-                description="Choose a note from the sidebar, or create a new one."
-                actionLabel="Create a note"
-                onAction={createNewNote}
-              />
+              {showMainEmpty ? (
+                <EmptyState
+                  title="Welcome to Ocean Notes"
+                  description="Create your first note. Everything is saved locally, and works offline."
+                  actionLabel="Create your first note"
+                  onAction={createNewNote}
+                />
+              ) : (
+                <EmptyState
+                  title="Select a note"
+                  description="Choose a note from the sidebar, or create a new one."
+                  actionLabel="Create a note"
+                  onAction={createNewNote}
+                />
+              )}
             </div>
           )}
         </main>
@@ -548,7 +715,7 @@ function App() {
 
 /* ----------------------------- Components ----------------------------- */
 
-function Header({ onNew, onDelete, canDelete, env, banner, isLoading }) {
+function Header({ onNew, onDelete, canDelete, env, banner, isLoading, saveStatusLabel }) {
   const bannerToneClass =
     banner?.tone === "danger"
       ? "Pill"
@@ -567,6 +734,11 @@ function Header({ onNew, onDelete, canDelete, env, banner, isLoading }) {
       </div>
 
       <div className="HeaderRight" role="toolbar" aria-label="App actions">
+        {/* Non-blocking save status */}
+        <span className="Pill PillMuted" aria-live="polite" title="Save status">
+          {saveStatusLabel}
+        </span>
+
         {/* Minimal, non-disruptive status */}
         {isLoading ? (
           <span className="Pill PillMuted" aria-live="polite">
@@ -636,17 +808,17 @@ function NoteEditor({
   content,
   isDirty,
   onTitleChange,
+  onTitleBlur,
   onContentChange,
   onDelete,
+  contentRef,
 }) {
   return (
     <section className="MainSurface">
       <div className="EditorHeader">
         <div className="EditorMeta" aria-live="polite">
           <span className="Pill PillPrimary">Editing</span>
-          <span className="EditorMetaText">
-            {isDirty ? "Unsaved changes…" : "All changes saved"}
-          </span>
+          <span className="EditorMetaText">{isDirty ? "Unsaved changes…" : "All changes saved"}</span>
           <span className="EditorMetaDivider" aria-hidden="true">
             |
           </span>
@@ -670,6 +842,7 @@ function NoteEditor({
           label="Title"
           value={title}
           onChange={(e) => onTitleChange(e.target.value)}
+          onBlur={onTitleBlur}
           placeholder="Untitled note"
           autoComplete="off"
         />
@@ -680,12 +853,14 @@ function NoteEditor({
           onChange={(e) => onContentChange(e.target.value)}
           placeholder="Write your note…"
           rows={14}
+          inputRef={contentRef}
         />
       </div>
 
       <div className="EditorFooter">
         <span className="Hint">
-          Tip: Use <kbd>↑</kbd>/<kbd>↓</kbd> to navigate notes in the sidebar.
+          Tip: Use <kbd>↑</kbd>/<kbd>↓</kbd> to navigate notes in the sidebar. Create note with{" "}
+          <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>N</kbd>.
         </span>
       </div>
     </section>
@@ -738,27 +913,52 @@ function Input({
   hideLabel = false,
   value,
   onChange,
+  onBlur,
   placeholder,
   autoComplete,
+  inputRef,
+  showShortcutHint = false,
 }) {
+  const [showHint, setShowHint] = useState(false);
+
   return (
-    <div className="Field">
+    <div className="Field SidebarSearchField">
       <label className={`FieldLabel ${hideLabel ? "srOnly" : ""}`} htmlFor={id}>
         {label}
       </label>
-      <input
-        id={id}
-        className="FieldInput"
-        value={value}
-        onChange={onChange}
-        placeholder={placeholder}
-        autoComplete={autoComplete}
-      />
+
+      <div className="InputWrap">
+        <input
+          id={id}
+          className="FieldInput"
+          value={value}
+          onChange={onChange}
+          onBlur={(e) => {
+            setShowHint(false);
+            if (onBlur) onBlur(e);
+          }}
+          onFocus={() => {
+            if (showShortcutHint) setShowHint(true);
+          }}
+          placeholder={placeholder}
+          autoComplete={autoComplete}
+          ref={inputRef}
+        />
+
+        {showShortcutHint && showHint ? (
+          <div className="KeyHint" role="tooltip" aria-label="Keyboard shortcuts">
+            <span className="Hint">
+              <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>F</kbd> search • <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>N</kbd>{" "}
+              new
+            </span>
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
 
-function TextArea({ id, label, value, onChange, placeholder, rows = 10 }) {
+function TextArea({ id, label, value, onChange, placeholder, rows = 10, inputRef }) {
   return (
     <div className="Field">
       <label className="FieldLabel" htmlFor={id}>
@@ -771,6 +971,7 @@ function TextArea({ id, label, value, onChange, placeholder, rows = 10 }) {
         onChange={onChange}
         placeholder={placeholder}
         rows={rows}
+        ref={inputRef}
       />
     </div>
   );
@@ -834,14 +1035,15 @@ function ConfirmModal({
           <Button variant="ghost" onClick={onCancel} ariaLabel={cancelText}>
             {cancelText}
           </Button>
-          <Button
-            variant={tone === "danger" ? "danger" : "primary"}
+          <button
+            type="button"
+            className={`Btn Btn--${tone === "danger" ? "danger" : "primary"} Btn--md`}
             onClick={onConfirm}
-            ariaLabel={confirmText}
+            aria-label={confirmText}
             ref={confirmRef}
           >
             {confirmText}
-          </Button>
+          </button>
         </div>
       </div>
     </div>
@@ -872,7 +1074,7 @@ function loadNotesWithSeed() {
       .filter((n) => n && typeof n === "object" && typeof n.id === "string")
       .map((n) => ({
         id: String(n.id),
-        title: typeof n.title === "string" ? n.title : "Untitled note",
+        title: typeof n.title === "string" ? n.title : "",
         content: typeof n.content === "string" ? n.content : "",
         createdAt: typeof n.createdAt === "number" ? n.createdAt : Date.now(),
         updatedAt: typeof n.updatedAt === "number" ? n.updatedAt : Date.now(),
@@ -903,10 +1105,51 @@ function seedNotes() {
     ),
     mk(
       "Keyboard tip",
-      "Click the notes list, then use ↑ / ↓ to move between notes.\n\nPress Escape to close the delete dialog.",
+      "Shortcuts:\n• Ctrl/Cmd+N to create a note\n• Ctrl/Cmd+F to focus search\n• Ctrl/Cmd+Backspace to delete the current note\n\nClick the notes list, then use ↑ / ↓ to move between notes.",
       oneHour
     ),
   ];
+}
+
+/**
+ * @param {string} content
+ * @returns {string}
+ */
+function generateTitleFromContent(content) {
+  const raw = String(content ?? "");
+  const lines = raw.split(/\r?\n/);
+  const firstNonEmpty = lines.map((l) => l.trim()).find((l) => l.length > 0) || "";
+  if (!firstNonEmpty) return "Untitled note";
+  return firstNonEmpty.length > 60 ? `${firstNonEmpty.slice(0, 60).trim()}…` : firstNonEmpty;
+}
+
+/**
+ * A note is considered "fully empty" when it has no meaningful title AND no content.
+ * @param {{title?: string, content?: string}} note
+ * @returns {boolean}
+ */
+function isNoteFullyEmpty(note) {
+  const t = (note?.title ?? "").trim();
+  const c = (note?.content ?? "").trim();
+  const titleMeaningful = t.length > 0 && t.toLowerCase() !== "untitled note";
+  return !titleMeaningful && c.length === 0;
+}
+
+/**
+ * @param {any} a
+ * @param {any} b
+ * @param {SortOrder} order
+ * @returns {number}
+ */
+function sortNotes(a, b, order) {
+  if (order === "created_desc") return (b.createdAt || 0) - (a.createdAt || 0);
+  if (order === "title_asc") {
+    const at = ((a.title || "").trim() || "Untitled note").toLowerCase();
+    const bt = ((b.title || "").trim() || "Untitled note").toLowerCase();
+    return at.localeCompare(bt);
+  }
+  // default: updated desc
+  return (b.updatedAt || 0) - (a.updatedAt || 0);
 }
 
 function formatDate(ms) {

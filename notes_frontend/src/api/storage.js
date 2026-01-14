@@ -8,6 +8,7 @@
 
 const NAMESPACE = "notesApp";
 const NOTES_KEY = `${NAMESPACE}:notes`;
+const UI_PREFS_KEY = `${NAMESPACE}:uiPrefs`;
 
 // PUBLIC_INTERFACE
 export function readNotes() {
@@ -33,6 +34,30 @@ export function writeNotes(notes) {
     window.localStorage.setItem(NOTES_KEY, JSON.stringify(Array.isArray(notes) ? notes : []));
   } catch {
     // Best-effort only; caller keeps app functional without persistence.
+  }
+}
+
+// PUBLIC_INTERFACE
+export function readUiPrefs(key = UI_PREFS_KEY) {
+  /** Read UI preferences from localStorage. Returns null on any error. */
+  try {
+    const raw = window.localStorage.getItem(String(key));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+// PUBLIC_INTERFACE
+export function writeUiPrefs(key = UI_PREFS_KEY, prefs) {
+  /** Persist UI preferences to localStorage (best effort). */
+  try {
+    window.localStorage.setItem(String(key), JSON.stringify(prefs && typeof prefs === "object" ? prefs : {}));
+  } catch {
+    // Best-effort only.
   }
 }
 
